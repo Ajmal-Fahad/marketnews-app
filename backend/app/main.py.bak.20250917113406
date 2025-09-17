@@ -1,0 +1,158 @@
+# ~/marketnews-app/backend/app/main.py
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy.orm import Session
+import os
+import pathlib
+import datetime
+import re
+from typing import List, Dict, Any
+
+# import your existing modules
+from . import models, db
+from .routers import market_summary as ms_router  # ensure this exists (you added it)
+
+app = FastAPI(title="MarketNews API", version="0.1")
+
+# Allow the frontend / Expo dev server to call this API
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    # add any other dev origins if needed (the mobile app uses direct IP requests)
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# include the market router you created earlier
+app.include_router(ms_router.router)
+
+# Dependency to get DB session
+def get_db():
+    database = db.SessionLocal()
+    try:
+        yield database
+    finally:
+        database.close()
+
+# Root endpoint
+@app.get("/")
+def read_root():
+    return {"message": "MarketNews API is running 🚀"}
+
+# Health check
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+# Create a new card (DB-backed)
+@app.post("/cards")
+def create_card(card: dict, database: Session = Depends(get_db)):
+    new_card = models.Card(**card)
+    database.add(new_card)
+    database.commit()
+    database.refresh(new_card)
+    return {"id": new_card.id, "message": "Card created"}
+
+# Get all cards
+@app.get("/cards")
+def list_cards(database: Session = Depends(get_db)):
+    cards = database.query(models.Card).all()
+    return cards
+
+# -------------------------
+# Announcements uploads: static mount + enriched listing
+# -------------------------
+# Determine backend base dir (project backend/)
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # backend/app -> backend
+UPLOADS_DIR = os.path.join(BASE_DIR, "announcements", "uploads")
+
+# Ensure uploads dir exists (server won't fail if missing; listing returns empty)
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+# mount static files so images/pdfs are reachable via HTTP
+# (access example: http://<host>:8000/announcements/uploads/INFY.png)
+app.mount("/announcements/uploads", StaticFiles(directory=UPLOADS_DIR), name="announcement_uploads")
+
+
+def extract_date_from_filename(name: str) -> str:
+    """
+    Try to extract YYYY-MM-DD from filename like eod_2025-09-16.csv or anything containing 2025-09-16.
+    Returns "no-date" if not found.
+    """
+    m = re.search(r"20[0-9]{2}[-_][01][0-9][-_][0-3][0-9]", name)
+    return m.group(0).replace("_", "-") if m else "no-date"
+
+
+@app.get("/announcements/list-enriched")
+def announcements_list_enriched() -> Dict[str, Any]:
+    """
+    Return enriched listing of files in announcements/uploads.
+    For each file attempts to:
+      - derive symbol from filename (basename before dot, uppercased)
+      - call market_summary.market_summary(symbol) to fetch market snapshot (if available)
+      - return metadata and enrichment
+    """
+    files = []
+    try:
+        for fname in sorted(os.listdir(UPLOADS_DIR)):
+            fpath = os.path.join(UPLOADS_DIR, fname)
+            if not os.path.isfile(fpath):
+                continue
+            st = os.stat(fpath)
+            mtime_iso = datetime.datetime.fromtimestamp(st.st_mtime).isoformat()
+            filename_date = extract_date_from_filename(fname)
+
+            # symbol guess: take filename stem before first dot/hyphen/underscore
+            stem = pathlib.Path(fname).stem
+            # sometimes filenames like "INFOSYS" or "INFY_1" -> pick token that looks like symbol
+            token = re.split(r"[\s._-]+", stem)[0].upper()
+            # remove non-alphanumeric just in case
+            token = re.sub(r"[^A-Z0-9]", "", token)
+
+            enriched = {"filename": fname, "download_url": f"/announcements/uploads/{fname}", "size_bytes": st.st_size, "mtime_iso": mtime_iso, "filename_date": filename_date, "symbol_guess": token}
+
+            # Try to enrich using market_summary router's function
+            try:
+                # ms_router.market_summary is a FastAPI route function, it expects a ticker string.
+                # Call it directly – it will read CSVs and return the same dict structure your router produces.
+                market_info = ms_router.market_summary(token)
+                # attach some useful fields only (avoid huge payloads)
+                enriched["company"] = market_info.get("company") or None
+                enriched["market_summary"] = {
+                    "ticker": market_info.get("ticker"),
+                    "csv_filename": market_info.get("csv_filename") if "csv_filename" in market_info else None,
+                    "eod_date": market_info.get("eod_date"),
+                    "price": market_info.get("price"),
+                    "price_display": market_info.get("price_display"),
+                    "change_1d_display": market_info.get("change_1d_display"),
+                    "change_1w_display": market_info.get("change_1w_display"),
+                    "volume_24h_display": market_info.get("volume_24h_display"),
+                    "mcap_display": market_info.get("mcap_display"),
+                    "rank": market_info.get("rank"),
+                    "vwap": market_info.get("vwap_display") or market_info.get("vwap"),
+                    "atr14": market_info.get("atr14_display"),
+                    "relative_vol": market_info.get("relative_vol"),
+                    "vol_change": market_info.get("vol_change"),
+                    "volatility": market_info.get("volatility"),
+                    "beta": market_info.get("beta"),
+                }
+            except HTTPException as he:
+                # not found in CSV or other error, just continue without market_summary
+                enriched["company"] = None
+                enriched["market_error"] = {"status_code": he.status_code, "detail": he.detail}
+            except Exception as e:
+                enriched["company"] = None
+                enriched["market_error"] = {"detail": str(e)}
+
+            files.append(enriched)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed reading uploads: {e}")
+
+    return {"count": len(files), "files": files}
